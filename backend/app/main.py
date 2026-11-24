@@ -5,21 +5,52 @@ import hashlib
 import os
 import sqlite3
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
+
+# Load configuration from .env if present
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from backend.app.translator import (
+    CANONICAL_FIELDS,
+    FieldTranslator,
+    MappingResult,
+    get_translator,
+)
+from backend.app.passport import (
+    FactCreateBody,
+    FactUpdateBody,
+    FactConfirmBody,
+    FactPermissionsBody,
+    list_passport_facts,
+    add_or_version_fact,
+    update_fact_value,
+    confirm_fact_version,
+    update_fact_permissions,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 DB = Path(os.getenv("CARRYFLOW_DB", str(ROOT / "carryflow.db")))
 NOW = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
 ALLOWED = {"http://127.0.0.1:8000", "http://localhost:8000"}
 
-app = FastAPI(title="CarryFlow", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    init()
+    yield
+
+
+app = FastAPI(title="CarryFlow", version="0.1.0", lifespan=lifespan)
 
 
 class ResolveBody(BaseModel):
@@ -36,30 +67,39 @@ class FillBody(BaseModel):
     observed: dict[str, str] = Field(default_factory=dict)
 
 
+class TranslateBody(BaseModel):
+    label: str
+    description: str | None = None
+
+
 def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB, timeout=10.0)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA journal_mode=WAL")
     return con
 
 
 def init() -> None:
     with db() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS facts(id TEXT, key TEXT, semantic_type TEXT, value TEXT, source_url TEXT, source_label TEXT, collected_at TEXT, version INTEGER, confidence REAL, verification TEXT, permitted_origins TEXT, purpose TEXT, user_confirmed INTEGER, PRIMARY KEY(id,version));
+        CREATE TABLE IF NOT EXISTS facts(id TEXT, key TEXT, semantic_type TEXT, value TEXT, source_url TEXT, source_label TEXT, collected_at TEXT, version INTEGER, confidence REAL, verification TEXT, permitted_origins TEXT, purpose TEXT, user_confirmed INTEGER, last_confirmed_at TEXT, PRIMARY KEY(id,version));
         CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, kind TEXT, title TEXT, detail TEXT, created_at TEXT);
         CREATE TABLE IF NOT EXISTS receipts(id TEXT PRIMARY KEY, origin TEXT, source_fact_id TEXT, source_version INTEGER, source_field TEXT, destination_field TEXT, semantic_type TEXT, mapping_type TEXT, reason TEXT, confidence REAL, permission TEXT, status TEXT, created_at TEXT);
         CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE, origin TEXT, action_type TEXT, payload_fingerprint TEXT, status TEXT, observed_result TEXT, verification TEXT, created_at TEXT);
         CREATE TABLE IF NOT EXISTS conflicts(id TEXT PRIMARY KEY, fact_id TEXT, old_version INTEGER, new_version INTEGER, resolved INTEGER DEFAULT 0, resolution_version INTEGER);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
         """)
-        # Upgrade the early single-version prototype schema without discarding its facts.
+        # Upgrade schema if needed
         info = c.execute("PRAGMA table_info(facts)").fetchall()
         if not next((col[5] for col in info if col[1] == "version"), 0):
             c.execute("ALTER TABLE facts RENAME TO facts_legacy")
-            c.execute("CREATE TABLE facts(id TEXT, key TEXT, semantic_type TEXT, value TEXT, source_url TEXT, source_label TEXT, collected_at TEXT, version INTEGER, confidence REAL, verification TEXT, permitted_origins TEXT, purpose TEXT, user_confirmed INTEGER, PRIMARY KEY(id,version))")
-            c.execute("INSERT INTO facts SELECT * FROM facts_legacy")
+            c.execute("CREATE TABLE facts(id TEXT, key TEXT, semantic_type TEXT, value TEXT, source_url TEXT, source_label TEXT, collected_at TEXT, version INTEGER, confidence REAL, verification TEXT, permitted_origins TEXT, purpose TEXT, user_confirmed INTEGER, last_confirmed_at TEXT, PRIMARY KEY(id,version))")
+            c.execute("INSERT INTO facts(id, key, semantic_type, value, source_url, source_label, collected_at, version, confidence, verification, permitted_origins, purpose, user_confirmed) SELECT * FROM facts_legacy")
             c.execute("DROP TABLE facts_legacy")
+        fact_columns = {col[1] for col in c.execute("PRAGMA table_info(facts)")}
+        if "last_confirmed_at" not in fact_columns:
+            c.execute("ALTER TABLE facts ADD COLUMN last_confirmed_at TEXT")
         action_columns = {col[1] for col in c.execute("PRAGMA table_info(actions)")}
         if "preconditions" not in action_columns:
             c.execute("ALTER TABLE actions ADD COLUMN preconditions TEXT NOT NULL DEFAULT '{}'")
@@ -67,6 +107,10 @@ def init() -> None:
         c.execute("INSERT OR IGNORE INTO meta VALUES('status','PENDING')")
         c.execute("INSERT OR IGNORE INTO meta VALUES('current_origin','http://127.0.0.1:8000/portal/source')")
         c.execute("INSERT OR IGNORE INTO meta VALUES('user_goal',?)", (StartBody().user_goal,))
+
+
+def startup() -> None:
+    init()
 
 
 def event(c: sqlite3.Connection, kind: str, title: str, detail: str = "") -> None:
@@ -91,9 +135,27 @@ PORTALS = {
 }
 
 
-@app.on_event("startup")
-def startup() -> None:
-    init()
+def get_current_facts(c: sqlite3.Connection) -> dict[str, sqlite3.Row]:
+    """Return the active fact for each semantic type, honoring conflict resolutions."""
+    resolved = {
+        row["fact_id"]: row["resolution_version"]
+        for row in c.execute("SELECT fact_id, resolution_version FROM conflicts WHERE resolved=1 ORDER BY rowid ASC").fetchall()
+    }
+    all_facts = c.execute("SELECT * FROM facts ORDER BY id, version DESC").fetchall()
+    by_id: dict[str, list[sqlite3.Row]] = {}
+    for f in all_facts:
+        by_id.setdefault(f["id"], []).append(f)
+    current: dict[str, sqlite3.Row] = {}
+    for fid, f_list in by_id.items():
+        chosen = None
+        if fid in resolved and resolved[fid] is not None:
+            chosen = next((f for f in f_list if f["version"] == resolved[fid]), None)
+        if not chosen:
+            non_superseded = [f for f in f_list if f["verification"] != "SUPERSEDED"]
+            chosen = non_superseded[0] if non_superseded else f_list[0]
+        if chosen:
+            current[chosen["semantic_type"]] = chosen
+    return current
 
 
 app.mount("/static", StaticFiles(directory=ROOT / "frontend"), name="static")
@@ -135,6 +197,47 @@ def state() -> dict[str, Any]:
     return {"facts": facts, "events": events, "receipts": receipts, "actions": actions, "conflicts": conflicts, "meta": meta, "portals": PORTALS}
 
 
+# --- Smart Personal Data Passport Endpoints ---
+
+@app.get("/api/passport")
+def get_passport() -> dict[str, Any]:
+    with db() as c:
+        return list_passport_facts(c)
+
+
+@app.post("/api/passport/fact")
+def create_passport_fact(body: FactCreateBody) -> dict[str, Any]:
+    with db() as c:
+        res = add_or_version_fact(c, body)
+        event(c, "passport", f"Fact '{body.label}' updated", f"Version {res['version']} recorded with status {res['verification']}.")
+        return res
+
+
+@app.put("/api/passport/fact/{fact_id}")
+def update_passport_fact(fact_id: str, body: FactUpdateBody) -> dict[str, Any]:
+    with db() as c:
+        res = update_fact_value(c, fact_id, body)
+        event(c, "passport", f"Fact '{fact_id}' edited", f"Action: {res['action']} (v{res['version']}).")
+        return res
+
+
+@app.post("/api/passport/fact/{fact_id}/confirm")
+def confirm_passport_fact(fact_id: str, body: FactConfirmBody | None = None) -> dict[str, Any]:
+    with db() as c:
+        target_version = body.version if body else None
+        res = confirm_fact_version(c, fact_id, target_version)
+        event(c, "approval", f"Fact '{fact_id}' confirmed", f"User confirmed version {res['version']}.")
+        return res
+
+
+@app.post("/api/passport/fact/{fact_id}/permissions")
+def update_passport_permissions(fact_id: str, body: FactPermissionsBody) -> dict[str, Any]:
+    with db() as c:
+        res = update_fact_permissions(c, fact_id, body)
+        event(c, "passport", f"Permissions updated for '{fact_id}'", f"Origins allowed: {', '.join(body.permitted_origins)}.")
+        return res
+
+
 @app.post("/api/reset")
 def reset() -> dict[str, bool]:
     with db() as c:
@@ -152,8 +255,13 @@ def start(body: StartBody | None = None) -> dict[str, Any]:
     goal = body.user_goal.strip() if body and body.user_goal.strip() else StartBody().user_goal
     with db() as c:
         if c.execute("SELECT count(*) FROM facts").fetchone()[0] == 0:
+            now_iso = NOW()
             for key, typ, value, label, conf in FACTS:
-                c.execute("INSERT INTO facts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (key, key, typ, value, PORTALS["a"]["url"].replace("/a", "/source"), label, NOW(), 1, conf, "VERIFIED", json.dumps(sorted(ALLOWED)), "internship application preparation", 1))
+                c.execute(
+                    "INSERT INTO facts(id, key, semantic_type, value, source_url, source_label, collected_at, version, confidence, verification, permitted_origins, purpose, user_confirmed, last_confirmed_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (key, key, typ, value, PORTALS["a"]["url"].replace("/a", "/source"), label, now_iso, 1, conf, "VERIFIED", json.dumps(sorted(ALLOWED)), "internship application preparation", 1, now_iso)
+                )
             event(c, "extract", "Profile facts verified", "8 synthetic facts recorded with source labels and permission scope.")
         c.execute("UPDATE meta SET value='RUNNING' WHERE key='status'")
         c.execute("UPDATE meta SET value=? WHERE key='user_goal'", (goal,))
@@ -163,12 +271,15 @@ def start(body: StartBody | None = None) -> dict[str, Any]:
 
 
 def semantic_for(label: str) -> str:
-    x = label.casefold().replace("_", " ")
-    rules = [("name", "person.name"), ("email", "person.email"), ("phone", "person.phone"), ("academic", "education.degree"), ("qualification", "education.degree"), ("degree", "education.degree"), ("completion", "education.graduation_year"), ("passing year", "education.graduation_year"), ("graduation", "education.graduation_year"), ("competenc", "skills.technical"), ("skill", "skills.technical"), ("current location", "address.current")]
-    for needle, typ in rules:
-        if needle in x:
-            return typ
-    return "address.unknown" if "location" in x else "unknown"
+    """Intelligent semantic mapping for a field label."""
+    res = get_translator().translate(label)
+    return res.semantic_type or ("address.unknown" if "location" in label.casefold() else "unknown")
+
+
+@app.post("/api/translate", response_model=MappingResult)
+def translate_field(body: TranslateBody) -> MappingResult:
+    """Direct field translation endpoint using Intelligent Field Translator."""
+    return get_translator().translate(label=body.label, description=body.description)
 
 
 @app.post("/api/prepare/{portal_key}")
@@ -177,20 +288,85 @@ def prepare(portal_key: str) -> dict[str, Any]:
         raise HTTPException(404)
     origin, fields = PORTALS[portal_key]["url"], PORTALS[portal_key]["fields"]
     destination_origin = origin.split("/portal/")[0]
+    translator = get_translator()
     with db() as c:
         c.execute("UPDATE meta SET value=? WHERE key='current_origin'", (origin,))
+        current_facts = get_current_facts(c)
         for field, label, declared in fields:
-            sem = semantic_for(label)
-            fact = c.execute("SELECT * FROM facts WHERE semantic_type=? ORDER BY version DESC LIMIT 1", (sem,)).fetchone() if sem != "address.unknown" else None
-            if sem == "address.unknown":
-                c.execute("INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), origin, "", 0, "Unresolved location", field, sem, "AMBIGUOUS", "Location may mean current or permanent address; label alone is insufficient.", .42, "REQUIRES_USER", "WAITING_FOR_USER", NOW()))
+            mapping = translator.translate(label)
+            sem = mapping.semantic_type or declared
+
+            # Check for ambiguous fields or fields requiring user review
+            if sem == "address.unknown" or mapping.canonical_field is None or mapping.requires_user_confirmation:
+                c.execute(
+                    "INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        str(uuid.uuid4()),
+                        origin,
+                        "",
+                        0,
+                        "Unresolved location" if sem == "address.unknown" else "Unresolved source",
+                        field,
+                        sem,
+                        "AMBIGUOUS" if sem == "address.unknown" else "REQUIRES_USER",
+                        mapping.explanation,
+                        mapping.confidence,
+                        "REQUIRES_USER",
+                        "WAITING_FOR_USER",
+                        NOW(),
+                    ),
+                )
                 continue
+
+            fact = current_facts.get(sem)
             if not fact:
                 continue
+
+            # USER CONTROL & SHARING CHECKS:
+            # 1. Unconfirmed facts must NOT be automatically proposed/shared
+            if not fact["user_confirmed"] or fact["verification"] in {"UNVERIFIED", "UNVERIFIED_CONFLICT"}:
+                c.execute(
+                    "INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        str(uuid.uuid4()),
+                        origin,
+                        fact["id"],
+                        fact["version"],
+                        fact["source_label"],
+                        field,
+                        sem,
+                        "UNCONFIRMED_FACT",
+                        f"'{fact['source_label']}' is not confirmed by the user. Confirmation required before sharing.",
+                        fact["confidence"],
+                        "REQUIRES_USER",
+                        "WAITING_FOR_USER",
+                        NOW(),
+                    ),
+                )
+                continue
+
+            # 2. Check origin sharing permission
             permitted = destination_origin in json.loads(fact["permitted_origins"])
             reason = f"'{label}' refers to {sem.replace('.', ' ')}; mapped from verified profile field '{fact['source_label']}'."
             status = "APPROVED" if permitted else "DENIED"
-            c.execute("INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), origin, fact["id"], fact["version"], fact["source_label"], field, sem, "SEMANTIC_EQUIVALENT", reason, fact["confidence"], status, "PROPOSED" if permitted else "BLOCKED", NOW()))
+            c.execute(
+                "INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()),
+                    origin,
+                    fact["id"],
+                    fact["version"],
+                    fact["source_label"],
+                    field,
+                    sem,
+                    "SEMANTIC_EQUIVALENT",
+                    reason,
+                    min(fact["confidence"], mapping.confidence),
+                    status,
+                    "PROPOSED" if permitted else "BLOCKED",
+                    NOW(),
+                ),
+            )
         event(c, "handoff", "Handoff receipts prepared", f"{PORTALS[portal_key]['name']}: semantic mappings recorded; ambiguous fields held for review.")
     return state()
 
@@ -201,7 +377,9 @@ def resolve(body: ResolveBody) -> dict[str, Any]:
         row = c.execute("SELECT * FROM facts WHERE id=? AND version=?", (body.fact_id, body.version)).fetchone()
         if not row:
             raise HTTPException(404, "Fact version not found")
-        c.execute("UPDATE facts SET verification='USER_CONFIRMED',user_confirmed=1 WHERE id=? AND version=?", (body.fact_id, body.version))
+        now_iso = NOW()
+        c.execute("UPDATE facts SET verification='USER_CONFIRMED',user_confirmed=1,last_confirmed_at=? WHERE id=? AND version=?", (now_iso, body.fact_id, body.version))
+        c.execute("UPDATE facts SET verification='SUPERSEDED' WHERE id=? AND version!=? AND verification='UNVERIFIED_CONFLICT'", (body.fact_id, body.version))
         c.execute("UPDATE conflicts SET resolved=1,resolution_version=? WHERE fact_id=? AND resolved=0", (body.version, body.fact_id))
         event(c, "approval", "Conflict resolved", f"User selected {row['source_label']} version {body.version}; previous versions retained.")
     return state()
@@ -213,7 +391,12 @@ def conflict() -> dict[str, Any]:
         row = c.execute("SELECT * FROM facts WHERE id='phone' ORDER BY version DESC LIMIT 1").fetchone()
         old = row["version"] if row else 0
         ver = old + 1
-        c.execute("INSERT INTO facts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", ("phone", "phone", "person.phone", "9123456780", PORTALS["b"]["url"], "Updated phone number", NOW(), ver, .88, "UNVERIFIED_CONFLICT", json.dumps(sorted(ALLOWED)), "internship application preparation", 0))
+        now_iso = NOW()
+        c.execute(
+            "INSERT INTO facts(id, key, semantic_type, value, source_url, source_label, collected_at, version, confidence, verification, permitted_origins, purpose, user_confirmed, last_confirmed_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("phone", "phone", "person.phone", "9123456780", PORTALS["b"]["url"], "Updated phone number", now_iso, ver, .88, "UNVERIFIED_CONFLICT", json.dumps(sorted(ALLOWED)), "internship application preparation", 0, None)
+        )
         c.execute("INSERT INTO conflicts VALUES(?,?,?,?,0,NULL)", (str(uuid.uuid4()), "phone", old, ver))
         event(c, "conflict", "Conflicting phone number detected", "The latest profile visit differs from the saved value. Choose a version before reuse.")
     return state()
@@ -224,10 +407,10 @@ def fill(body: FillBody) -> dict[str, Any]:
     if body.origin not in {p["url"] for p in PORTALS.values()}:
         raise HTTPException(403, "Origin is outside the approved local demo scope")
     with db() as c:
-        current = {r["semantic_type"]: r for r in c.execute("SELECT * FROM facts WHERE version=(SELECT max(version) FROM facts f2 WHERE f2.id=facts.id)")}
+        current = get_current_facts(c)
         for rec in c.execute("SELECT * FROM receipts WHERE origin=? AND status='PROPOSED'", (body.origin,)).fetchall():
             fact = current.get(rec["semantic_type"])
-            if not fact or fact["verification"] == "UNVERIFIED_CONFLICT":
+            if not fact or fact["verification"] in {"UNVERIFIED", "UNVERIFIED_CONFLICT"} or not fact["user_confirmed"]:
                 continue
             key = f"{rec['origin']}|{rec['destination_field']}|{fact['id']}|{fact['version']}"
             fp = hashlib.sha256(fact["value"].encode("utf-8")).hexdigest()
@@ -300,6 +483,6 @@ def submit_approve() -> dict[str, Any]:
             raise HTTPException(409, "Submission outcome is not safe to retry")
         # Demo page is not actually submitted; this records approval and a deterministic confirmation.
         c.execute("UPDATE actions SET status='VERIFIED',observed_result='Approved locally; demo confirmation CF-DEMO-2048',verification='VERIFIED' WHERE id=?", (row["id"],))
+        c.execute("UPDATE meta SET value='COMPLETED' WHERE key='status'")
         event(c, "verified", "Demo submission approved", "Confirmation CF-DEMO-2048 recorded; demo site did not send data externally.")
     return state()
-
