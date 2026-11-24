@@ -1,41 +1,177 @@
-# CarryFlow — Beyond the Browser
+# CarryFlow — AI-Powered Browser Task Assistant
 
-CarryFlow is a local-first cross-website workflow demo. Its differentiator is a persistent **Workflow Passport**: versioned facts with provenance and permissions, semantic handoff receipts, conflict resolution, and recovery that reconciles saved actions with the destination page before continuing.
+> **Beyond the browser.** CarryFlow is a local-first cross-website workflow assistant with a persistent Smart Personal Data Passport, AI-powered field translation, conflict detection, and Playwright-based real browser automation.
 
-## Run locally
+---
 
-Requires Python 3.11+ and the packages in `requirements.txt`.
+## 📁 Project Structure
+
+```
+wHack/
+├── backend/
+│   ├── app/
+│   │   ├── main.py              # FastAPI app — all API endpoints
+│   │   ├── passport.py          # Smart Personal Data Passport (CRUD, versioning, permissions)
+│   │   ├── translator/          # AI Field Translator
+│   │   │   ├── canonical.py     # 8 canonical field definitions
+│   │   │   ├── providers.py     # MockMappingProvider + LLMMappingProvider
+│   │   │   ├── schema.py        # Pydantic schemas (MappingResult, RawLLMResponse)
+│   │   │   ├── service.py       # FieldTranslator (validation, hallucination guard)
+│   │   │   └── __init__.py
+│   │   └── automation/          # Phase 4: Playwright Browser Automation
+│   │       ├── manager.py       # PlaywrightManager (Chromium lifecycle, origin guard)
+│   │       ├── automator.py     # FormAutomator (inspect, fill, observe — never submits)
+│   │       └── __init__.py
+│   └── tests/
+│       ├── test_carryflow.py    # 9 core workflow tests
+│       ├── test_translator.py   # 12 AI field translator tests
+│       ├── test_passport.py     # 8 Smart Passport tests
+│       ├── test_demo_audit.py   # 2 end-to-end audit tests
+│       └── test_playwright_manager.py  # 3 Playwright automation tests
+├── frontend/
+│   ├── index.html               # Dashboard shell (3-column layout)
+│   ├── app.js                   # All UI logic (render, fill, resolve, passport modals)
+│   ├── app.css                  # Dashboard + Passport styles
+│   ├── portal.css               # Shared portal styles
+│   ├── portal-variants.css      # Portal A / B brand variants
+│   └── goal.css                 # Goal card styles
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── COMPETITIVE_RESEARCH.md
+│   ├── DEMO_SCRIPT.md
+│   ├── INNOVATION.md
+│   ├── PRODUCT_SPEC.md
+│   └── SECURITY.md
+├── .vscode/
+│   ├── launch.json              # Run server + tests with F5
+│   ├── settings.json            # Python interpreter, test discovery
+│   ├── tasks.json               # Ctrl+Shift+B tasks
+│   └── extensions.json          # Recommended extensions
+├── .env.example                 # Copy to .env and fill in keys
+├── .gitignore
+├── pytest.ini
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+- Python 3.11 or higher
+- PowerShell (Windows) or Bash (Mac/Linux)
+
+### 1. Clone & Setup
 
 ```powershell
+# Clone the repo
+git clone <your-repo-url>
+cd wHack
+
+# Create virtual environment
 python -m venv .venv
+
+# Activate it (Windows)
 .\.venv\Scripts\Activate.ps1
+
+# Install dependencies
 pip install -r requirements.txt
+```
+
+### 2. Configure Environment
+
+```powershell
+# Copy the example config
+Copy-Item .env.example .env
+
+# .env works as-is for the demo (mock AI mode, no API key needed)
+# To use a real LLM, edit .env:
+#   LLM_PROVIDER=gemini
+#   LLM_API_KEY=your-key-here
+```
+
+### 3. Run the App
+
+```powershell
 uvicorn backend.app.main:app --reload
 ```
 
-Open http://127.0.0.1:8000. No API key is required. The mock reasoning mode uses deterministic semantic mappings. The three demo websites are served locally and use synthetic student data.
+Open **http://127.0.0.1:8000** in your browser.
 
-## Demo
+---
 
-1. Select **Start demo**. CarryFlow reads the source profile and creates a passport.
-2. Open Portal A, review its handoff receipts, then fill the prepared application.
-3. Open Portal B. Its qualification and completion-year labels differ; its location field is deliberately ambiguous. Inspect the receipts and fill the unambiguous fields.
-4. Use **Introduce phone conflict** to version a changed phone number, then resolve it in the conflict card.
-5. Use **Interrupt & resume**. CarryFlow reads the actual portal fields in the embedded page and compares them with the action ledger before deciding what remains.
-6. The **Prepare submission** action creates a prepared receipt and waits for approval. No final submission occurs without approval.
-
-To reset the synthetic demo, use **Reset demo**. Data is stored in `carryflow.db`.
-
-## Development
+## 🧪 Running Tests
 
 ```powershell
-pytest
+# Run all tests
+.\.venv\Scripts\pytest -v
+
+# Run a specific test file
+.\.venv\Scripts\pytest backend/tests/test_carryflow.py -v
+
+# Run with detailed output on failure
+.\.venv\Scripts\pytest -v --tb=long
 ```
 
-The test suite covers versions, provenance, semantic distinctions, conflicts, permissions, receipt creation, action idempotency, and recovery reconciliation.
+**Current test status:** 31 passing tests across 4 suites.
 
-## Scope and limitations
+---
 
-This hackathon MVP operates only on its three allowlisted local demo origins. Semantic interpretation is deterministic and rule-based in mock mode; it does not claim general natural-language browsing. The local browser preview is a real same-origin iframe, but the product does not attach to arbitrary third-party sessions. Site state reconciliation can verify visible form values and demo confirmation identifiers; external websites without idempotency support cannot guarantee exactly-once effects. Passwords, OTPs, and payment data are not modeled or stored.
+## 🎮 Demo Walkthrough
 
-See `docs/` for competitive research, product specification, innovation, architecture, security, and the demo script.
+1. **Start demo** — CarryFlow loads 8 synthetic profile facts (Aarav Mehta) into the Passport.
+2. **Navigate to Portal A** (Northstar Internships) → **Prepare this portal** — AI Field Translator maps differently-labelled fields to canonical profile fields.
+3. **Fill approved fields** — Only confirmed, permitted facts are written. Ambiguous fields are held for review.
+4. **Navigate to Portal B** (Summit Talent) — Different labels (`highest_qualification`, `passing_year`, `core_competencies`) auto-translate to the same canonical facts. The generic `location` field is flagged as ambiguous.
+5. **Introduce phone conflict** — Creates a versioned fact conflict. Resolve it in the Conflict card (choose v1 or v2).
+6. **Interrupt & resume** — CarryFlow reads live page values and reconciles them with the action ledger before replaying any fills.
+7. **Prepare submission → Approve** — Two-step submission. No data is sent externally.
+
+> Reset anytime with **Reset demo**.
+
+---
+
+## ⚙️ Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_PROVIDER` | `mock` | `mock`, `gemini`, `openai`, `anthropic` |
+| `LLM_API_KEY` | _(empty)_ | API key for LLM provider |
+| `LLM_MODEL` | _(auto)_ | Model name override |
+| `DATABASE_URL` | `sqlite:///./carryflow.db` | SQLite database path |
+| `BROWSER_MODE` | `playwright` | `playwright` or `iframe` |
+| `PLAYWRIGHT_HEADLESS` | `true` | Run Chromium headless |
+| `PLAYWRIGHT_SLOWMO` | `50` | Slow-mo ms for Playwright |
+
+---
+
+## 🔒 Security Design
+
+- Only two approved local origins (`http://127.0.0.1:8000`, `http://localhost:8000`) are allowed.
+- Unconfirmed facts are **never** auto-shared with any portal.
+- Ambiguous fields (e.g. generic "Location") are always held for user review.
+- LLM output is validated against a strict canonical field allowlist — hallucinated fields are rejected.
+- The final submission button is **never** clicked automatically.
+- No real personal data is used anywhere (synthetic Aarav Mehta profile only).
+
+---
+
+## 🧠 Architecture Highlights
+
+| Component | Technology |
+|---|---|
+| Backend | Python 3.11+, FastAPI, SQLite (WAL mode) |
+| Frontend | Vanilla HTML/CSS/JavaScript (no framework) |
+| AI Field Translator | Rule-based mock + LLM (Gemini/OpenAI/Anthropic) |
+| Browser Automation | Playwright (async, Chromium) |
+| Data Model | Versioned facts with provenance, semantic types, permissions |
+| Test Suite | pytest (31 tests, no external dependencies) |
+
+See `docs/ARCHITECTURE.md` for the full design.
+
+---
+
+## 📜 License
+
+MIT — Hackathon MVP. Synthetic data only.

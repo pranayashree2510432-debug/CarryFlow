@@ -1,0 +1,35 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.terminal.activateEnvironment": true,
+
+  "[python]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "ms-python.black-formatter"
+  },
+
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["-v", "--tb=short"],
+  "python.testing.cwd": "${workspaceFolder}",
+
+  "editor.rulers": [100],
+  "editor.tabSize": 4,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/*.pyc": true,
+    ".venv": true
+  },
+
+  "search.exclude": {
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/.pytest_cache": true
+  },
+
+  "emmet.excludeLanguages": ["markdown"],
+  "editor.wordWrap": "off",
+  "terminal.integrated.defaultProfile.windows": "PowerShell"
+}
