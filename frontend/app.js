@@ -1,6 +1,7 @@
 const $ = s => document.querySelector(s);
 let selected = 'facts';
 let cachedState = null;
+let browserMode = 'iframe';
 const browser = $('#browser');
 const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -342,6 +343,52 @@ function currentOrigin() {
   }
 }
 
+async function updateScreenshot() {
+  try {
+    const res = await fetch('/api/automation/screenshot?t=' + Date.now());
+    if (res.ok) {
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const img = $('#playwright-screenshot');
+      const ph = $('#playwright-placeholder');
+      if (img) {
+        img.src = url;
+        img.style.display = 'block';
+      }
+      if (ph) ph.style.display = 'none';
+    }
+  } catch {}
+}
+
+function setMode(mode) {
+  browserMode = mode;
+  const btnIframe = $('#mode-iframe');
+  const btnPlaywright = $('#mode-playwright');
+  const iframeEl = $('#browser');
+  const pwContainer = $('#playwright-container');
+  const connState = $('#conn-state');
+
+  if (mode === 'playwright') {
+    if (btnPlaywright) btnPlaywright.classList.add('active');
+    if (btnIframe) btnIframe.classList.remove('active');
+    if (iframeEl) iframeEl.style.display = 'none';
+    if (pwContainer) pwContainer.style.display = 'block';
+    if (connState) connState.textContent = 'Playwright Chromium connected';
+    // Navigate Playwright browser to match current view
+    const origin = currentOrigin();
+    api('automation/navigate', {url: origin}).then(() => updateScreenshot()).catch(() => {});
+  } else {
+    if (btnIframe) btnIframe.classList.add('active');
+    if (btnPlaywright) btnPlaywright.classList.remove('active');
+    if (iframeEl) iframeEl.style.display = 'block';
+    if (pwContainer) pwContainer.style.display = 'none';
+    if (connState) connState.textContent = 'Browser connected';
+  }
+}
+
+$('#mode-iframe').onclick = () => setMode('iframe');
+$('#mode-playwright').onclick = () => setMode('playwright');
+
 function observed() {
   try {
     const doc = browser.contentDocument;
@@ -382,8 +429,10 @@ function observed() {
 function navigate(url, name) {
   browser.src = url;
   $('#site-name').textContent = name;
+  let fullUrl = url;
   try {
     const u = new URL(url, window.location.origin);
+    fullUrl = u.origin + u.pathname;
     $('#address').textContent = u.host + u.pathname;
   } catch {
     $('#address').textContent = url.replace('http://', '');
@@ -393,6 +442,12 @@ function navigate(url, name) {
     $('#browser-state').textContent = 'Source profile · Facts ready to carry forward';
   } else {
     $('#browser-state').textContent = 'Page ready · synthetic data';
+  }
+
+  if (browserMode === 'playwright') {
+    api('automation/navigate', {url: fullUrl})
+      .then(() => updateScreenshot())
+      .catch(() => {});
   }
 }
 
@@ -434,6 +489,19 @@ $('#prepare').onclick = async () => {
 };
 
 $('#fill').onclick = async () => {
+  if (browserMode === 'playwright') {
+    $('#browser-state').textContent = 'Playwright is filling approved fields...';
+    try {
+      await api('automation/fill');
+      await updateScreenshot();
+      $('#browser-state').textContent = 'Playwright filled approved fields into Chromium';
+    } catch (e) {
+      $('#browser-state').textContent = 'Playwright fill error: ' + e.message;
+    }
+    await load();
+    return;
+  }
+
   const s = await (await fetch('/api/state')).json();
   const origin = currentOrigin();
   const pending = s.receipts.filter(r => r.origin === origin && r.status === 'PROPOSED');
@@ -485,6 +553,19 @@ $('#conflict').onclick = async () => {
 };
 
 $('#recover').onclick = async () => {
+  if (browserMode === 'playwright') {
+    $('#browser-state').textContent = 'Playwright inspecting live DOM...';
+    try {
+      await api('automation/recover');
+      await updateScreenshot();
+      $('#browser-state').textContent = 'Playwright inspected live page · reconciled';
+    } catch (e) {
+      $('#browser-state').textContent = 'Playwright recovery error: ' + e.message;
+    }
+    await load();
+    return;
+  }
+
   const origin = currentOrigin();
   await api('recover', {origin, observed: observed()});
   $('#browser-state').textContent = 'Actual page read · saved actions reconciled';

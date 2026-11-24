@@ -15,10 +15,12 @@ from dotenv import load_dotenv
 # Load configuration from .env if present
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+from backend.app.automation import FormAutomator, get_playwright_manager
 
 from backend.app.translator import (
     CANONICAL_FIELDS,
@@ -48,6 +50,12 @@ ALLOWED = {"http://127.0.0.1:8000", "http://localhost:8000"}
 async def lifespan(app_instance: FastAPI):
     init()
     yield
+    try:
+        mgr = get_playwright_manager()
+        if mgr.is_running:
+            await mgr.stop()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="CarryFlow", version="0.1.0", lifespan=lifespan)
@@ -486,3 +494,135 @@ def submit_approve() -> dict[str, Any]:
         c.execute("UPDATE meta SET value='COMPLETED' WHERE key='status'")
         event(c, "verified", "Demo submission approved", "Confirmation CF-DEMO-2048 recorded; demo site did not send data externally.")
     return state()
+
+
+# --- Playwright Real Browser Automation Endpoints ---
+
+class AutomationNavigateBody(BaseModel):
+    url: str
+
+
+@app.get("/api/automation/status")
+def automation_status() -> dict[str, Any]:
+    """Return live status of Playwright browser."""
+    return get_playwright_manager().get_status()
+
+
+@app.post("/api/automation/start")
+async def automation_start() -> dict[str, Any]:
+    """Launch Playwright Chromium browser."""
+    mgr = get_playwright_manager()
+    started = await mgr.start()
+    return {"ok": started, **mgr.get_status()}
+
+
+@app.post("/api/automation/stop")
+async def automation_stop() -> dict[str, Any]:
+    """Stop Playwright Chromium browser."""
+    mgr = get_playwright_manager()
+    await mgr.stop()
+    return {"ok": True, **mgr.get_status()}
+
+
+@app.post("/api/automation/navigate")
+async def automation_navigate(body: AutomationNavigateBody) -> dict[str, Any]:
+    """Navigate Playwright browser to an approved portal URL."""
+    mgr = get_playwright_manager()
+    try:
+        res = await mgr.navigate(body.url)
+    except ValueError as e:
+        raise HTTPException(403, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Navigation failed: {e}")
+
+    with db() as c:
+        c.execute("UPDATE meta SET value=? WHERE key='current_origin'", (body.url,))
+        event(c, "navigation", f"Automated browser navigated to {body.url}")
+
+    return {**res, "state": state()}
+
+
+@app.post("/api/automation/fill")
+async def automation_fill() -> dict[str, Any]:
+    """Fill approved form fields in Playwright Chromium browser and verify via action ledger."""
+    mgr = get_playwright_manager()
+    page = await mgr.get_page()
+
+    with db() as c:
+        current_origin = c.execute("SELECT value FROM meta WHERE key='current_origin'").fetchone()[0]
+        if current_origin not in {p["url"] for p in PORTALS.values()}:
+            raise HTTPException(403, "Current origin is outside approved scope")
+
+        current = get_current_facts(c)
+        proposed_receipts = c.execute(
+            "SELECT * FROM receipts WHERE origin=? AND status='PROPOSED' AND permission='APPROVED'",
+            (current_origin,),
+        ).fetchall()
+
+        field_values: dict[str, str] = {}
+        for rec in proposed_receipts:
+            fact = current.get(rec["semantic_type"])
+            if not fact or fact["verification"] in {"UNVERIFIED", "UNVERIFIED_CONFLICT"} or not fact["user_confirmed"]:
+                continue
+            field_values[rec["destination_field"]] = fact["value"]
+
+    # Fill fields via Playwright (safety guarantee: FormAutomator never clicks submission buttons)
+    fill_outcome = await FormAutomator.fill_fields(page, field_values)
+    observed = fill_outcome["observed"]
+
+    # Reconcile observed values with the action ledger
+    fill_state = fill(FillBody(origin=current_origin, observed=observed))
+
+    # Capture updated screenshot
+    try:
+        await mgr.capture_screenshot()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "filled": fill_outcome["filled"],
+        "observed": observed,
+        "errors": fill_outcome["errors"],
+        **fill_state,
+    }
+
+
+@app.post("/api/automation/recover")
+async def automation_recover() -> dict[str, Any]:
+    """Read live Playwright DOM and reconcile with action ledger."""
+    mgr = get_playwright_manager()
+    page = await mgr.get_page()
+
+    with db() as c:
+        current_origin = c.execute("SELECT value FROM meta WHERE key='current_origin'").fetchone()[0]
+        if current_origin not in {p["url"] for p in PORTALS.values()}:
+            raise HTTPException(403, "Current origin outside approved scope")
+
+    observed = await FormAutomator.observe_fields(page)
+    rec_state = recover(FillBody(origin=current_origin, observed=observed))
+
+    try:
+        await mgr.capture_screenshot()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "observed": observed,
+        **rec_state,
+    }
+
+
+@app.get("/api/automation/screenshot")
+async def automation_screenshot() -> Response:
+    """Stream live screenshot of the Playwright browser."""
+    mgr = get_playwright_manager()
+    if not mgr.is_running:
+        return Response(status_code=404, content="Browser is not running", media_type="text/plain")
+    try:
+        data = await mgr.capture_screenshot()
+        return Response(content=data, media_type="image/png")
+    except Exception as e:
+        raise HTTPException(500, f"Screenshot capture failed: {e}")
+
