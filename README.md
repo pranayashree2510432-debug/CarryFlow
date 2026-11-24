@@ -4,7 +4,7 @@
 
 ---
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 wHack/
@@ -56,7 +56,7 @@ wHack/
 
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### Prerequisites
 - Python 3.11 or higher
@@ -118,7 +118,7 @@ Open **http://127.0.0.1:8000** in your browser.
 
 ---
 
-## 🎮 Demo Walkthrough
+##  Demo Walkthrough
 
 1. **Start demo** — CarryFlow loads 8 synthetic profile facts (Aarav Mehta) into the Passport.
 2. **Navigate to Portal A** (Northstar Internships) → **Prepare this portal** — AI Field Translator maps differently-labelled fields to canonical profile fields.
@@ -132,7 +132,7 @@ Open **http://127.0.0.1:8000** in your browser.
 
 ---
 
-## ⚙️ Configuration
+##  Configuration
 
 | Variable | Default | Description |
 |---|---|---|
@@ -146,7 +146,7 @@ Open **http://127.0.0.1:8000** in your browser.
 
 ---
 
-## 🔒 Security Design
+##  Security Design
 
 - Only two approved local origins (`http://127.0.0.1:8000`, `http://localhost:8000`) are allowed.
 - Unconfirmed facts are **never** auto-shared with any portal.
@@ -157,7 +157,7 @@ Open **http://127.0.0.1:8000** in your browser.
 
 ---
 
-## 🧠 Architecture Highlights
+## Architecture Highlights
 
 | Component | Technology |
 |---|---|
@@ -172,6 +172,6 @@ See `docs/ARCHITECTURE.md` for the full design.
 
 ---
 
-## 📜 License
+##  License
 
 MIT — Hackathon MVP. Synthetic data only.
